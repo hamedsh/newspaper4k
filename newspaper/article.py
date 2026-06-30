@@ -19,7 +19,7 @@ import newspaper.parsers as parsers
 from newspaper.exceptions import ArticleException
 from newspaper.text import StopWords
 
-from . import network, nlp, settings, urls
+from . import network, network_async, nlp, settings, urls
 from .cleaners import DocumentCleaner
 from .configuration import Configuration
 from .extractors import ContentExtractor
@@ -407,6 +407,116 @@ class Article:
                     )
                     new_url = urls.prepare_url(new_url, self.url)
                     html_ = self._parse_scheme_http(new_url)
+                    if html_ is not None:
+                        html = html_
+                        self.url = new_url
+                        log.info(
+                            "Downloaded read more link: %s and updated url to %s",
+                            new_url,
+                            self.url,
+                        )
+                    else:
+                        log.info(
+                            "Failed to download read more link: %s, leaving original content in place",
+                            new_url,
+                        )
+                    break
+
+        self.html = html
+        if title is not None:
+            self.title = title
+
+        return self
+
+    # ------------------------------------------------------------------
+    # Async API
+    # ------------------------------------------------------------------
+
+    async def _parse_scheme_http_async(self, url: str | None = None):
+        """Async counterpart of :meth:`_parse_scheme_http`."""
+        import httpx  # noqa: PLC0415
+
+        try:
+            html, status_code, history = await network_async.get_html_status_async(
+                url or self.url, self.config
+            )
+            self.history = [str(r.url) for r in history]
+            if status_code >= 400:
+                self.download_state = ArticleDownloadState.FAILED_RESPONSE
+                protection = self._detect_protection(html)
+                if protection:
+                    self.download_exception_msg = f"Website protected with {protection}, url: {url}"
+                else:
+                    self.download_exception_msg = f"Status code {status_code} for url {url}"
+                return None
+        except httpx.RequestError as e:
+            self.download_state = ArticleDownloadState.FAILED_RESPONSE
+            self.download_exception_msg = str(e)
+            return None
+
+        return html
+
+    async def download_async(
+        self,
+        input_html: str | None = None,
+        title: str | None = None,
+        recursion_counter: int = 0,
+        ignore_read_more: bool = False,
+    ) -> "Article":
+        """Async version of :meth:`download`.
+
+        Downloads the article HTML without blocking the event loop.  All
+        parameters have the same meaning as in :meth:`download`.
+
+        Args:
+            input_html (str, optional): Pre-fetched HTML; skips the network
+                request when supplied. Defaults to None.
+            title (str, optional): Force an article title. Defaults to None.
+            recursion_counter (int, optional): Guards against infinite
+                meta-refresh loops. Defaults to 0.
+            ignore_read_more (bool, optional): Skip read-more link
+                resolution. Defaults to False.
+
+        Returns:
+            Article: self
+        """
+        if input_html is None:
+            parsed_url = urlparse(self.url)
+            if parsed_url.scheme == "file":
+                html = self._parse_scheme_file(parsed_url.path)
+            else:
+                html = await self._parse_scheme_http_async()
+            if html is None:
+                log.debug(
+                    "Async download failed on URL %s because of %s",
+                    self.url,
+                    self.download_exception_msg,
+                )
+                return self
+        else:
+            html = input_html
+
+        if self.config.follow_meta_refresh:
+            meta_refresh_url = extract_meta_refresh(html)
+            if meta_refresh_url and recursion_counter < 1:
+                refresh_html = await network_async.get_html_async(meta_refresh_url, self.config)
+                return await self.download_async(
+                    input_html=refresh_html,
+                    recursion_counter=recursion_counter + 1,
+                )
+
+        if not ignore_read_more and self.read_more_link:
+            doc = parsers.fromstring(html)
+            for read_more_node in doc.xpath(self.read_more_link):
+                if read_more_node.get("href"):
+                    new_url = read_more_node.get("href")
+                    log.info(
+                        "After downloading %s, found read more link: %s",
+                        self.url,
+                        new_url,
+                    )
+                    new_url = urls.prepare_url(new_url, self.url)
+                    html_ = await self._parse_scheme_http_async(new_url)
                     if html_ is not None:
                         html = html_
                         self.url = new_url

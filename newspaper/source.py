@@ -618,6 +618,200 @@ class Source:
         self.articles = [a for a in self.articles if a.is_valid_body()]
         self.is_parsed = True
 
+    # ------------------------------------------------------------------
+    # Async API
+    # ------------------------------------------------------------------
+
+    async def download_async(self):
+        """Async version of :meth:`download`.
+
+        Downloads the source homepage HTML without blocking the event loop.
+        """
+        from .network_async import get_html_async  # noqa: PLC0415
+
+        self.html = await get_html_async(self.url, self.config)
+
+    async def download_categories_async(self):
+        """Async version of :meth:`download_categories`."""
+        from .network_async import get_html_async, multithread_request_async  # noqa: PLC0415
+
+        category_urls = self.category_urls()
+        responses = await multithread_request_async(category_urls, self.config)
+
+        for response, category in zip(responses, self.categories, strict=False):
+            if response and response.status_code < 400:
+                try:
+                    html = await get_html_async(category.url, self.config, response)
+                    category.html = html
+                except Exception as e:
+                    log.warning(
+                        "download_categories_async(): Error downloading %s: %s",
+                        category.url,
+                        e,
+                    )
+                    category.html = None
+
+        self.categories = [c for c in self.categories if c.html]
+        return self.categories
+
+    async def download_feeds_async(self):
+        """Async version of :meth:`download_feeds`."""
+        from .network_async import get_html_async, multithread_request_async  # noqa: PLC0415
+
+        feed_urls = self.feed_urls()
+        responses = await multithread_request_async(feed_urls, self.config)
+
+        for response, feed in zip(responses, self.feeds, strict=False):
+            if response and response.status_code < 400:
+                try:
+                    feed.rss = await get_html_async(feed.url, self.config, response)
+                except Exception as e:
+                    log.warning(
+                        "download_feeds_async(): Error downloading %s: %s",
+                        feed.url,
+                        e,
+                    )
+                    feed.rss = None
+
+        self.feeds = [f for f in self.feeds if f.rss]
+        return self.feeds
+
+    async def set_feeds_async(self):
+        """Async version of :meth:`set_feeds`."""
+        import re as _re  # noqa: PLC0415
+        from urllib.parse import urljoin as _urljoin, urlsplit as _urlsplit, urlunsplit as _urlunsplit  # noqa: PLC0415
+
+        from .network_async import multithread_request_async  # noqa: PLC0415
+
+        common_feed_suffixes = ["/feed", "/feeds", "/rss"]
+        common_feed_urls = [_urljoin(self.url, url) for url in common_feed_suffixes]
+
+        split = _urlsplit(self.url)
+        if split.netloc in ("medium.com", "www.medium.com"):
+            if split.path.startswith("/@"):
+                new_path = "/feed/" + split.path.split("/")[1]
+                new_parts = split.scheme, split.netloc, new_path, "", ""
+                common_feed_urls.append(_urlunsplit(new_parts))
+
+        for cat in self.categories:
+            path_chunks = [x for x in cat.url.split("/") if len(x) > 0]
+            if len(path_chunks) and "." in path_chunks[-1]:
+                continue
+            for suffix in common_feed_suffixes:
+                common_feed_urls.append(cat.url + suffix)
+
+        responses = await multithread_request_async(common_feed_urls, self.config)
+
+        common_feed_urls_as_categories = []
+        for response in responses:
+            if not response or response.status_code > 299:
+                continue
+            feed = Category(url=str(response.url), html=response.text)
+            feed.doc = parsers.fromstring(feed.html)
+            if feed.doc is not None:
+                common_feed_urls_as_categories.append(feed)
+
+        categories_and_common_feed_urls = self.categories + common_feed_urls_as_categories
+        categories_and_common_feed_urls.append(
+            Category(
+                url=self.url,
+                html=self.html,
+                doc=self.doc,
+            )
+        )
+        url_list = self.extractor.get_feed_urls(self.url, categories_and_common_feed_urls)
+        self.feeds = [Feed(url=url) for url in url_list]
+
+    async def download_articles_async(self) -> list[Article]:
+        """Async version of :meth:`download_articles`.
+
+        Fetches all article URLs concurrently using asyncio and populates
+        :attr:`articles` with the downloaded HTML.
+
+        Returns:
+            list[Article]: The list of downloaded :class:`Article` objects.
+        """
+        import asyncio  # noqa: PLC0415
+
+        from .network_async import get_html_async, multithread_request_async  # noqa: PLC0415
+
+        url_list = self.article_urls()
+        responses = await multithread_request_async(url_list, self.config)
+
+        failed_articles: list[str] = []
+
+        async def _download_one(article: Article, response) -> Article:
+            if response and response.status_code < 400:
+                html = await get_html_async(article.url, self.config, response)
+            else:
+                failed_articles.append(article.url)
+                html = ""
+            return await article.download_async(input_html=html)
+
+        self.articles = list(
+            await asyncio.gather(
+                *[
+                    _download_one(article, response)
+                    for article, response in zip(self.articles, responses, strict=False)
+                ]
+            )
+        )
+
+        self.is_downloaded = True
+
+        if failed_articles:
+            log.warning(
+                "There were %d articles that failed to download: %s",
+                len(failed_articles),
+                ", ".join(failed_articles),
+            )
+
+        return self.articles
+
+    async def build_async(
+        self,
+        input_html: str | None = None,
+        only_homepage: bool = False,
+        only_in_path: bool = False,
+    ):
+        """Async version of :meth:`build`.
+
+        Encapsulates async download and basic parsing. Fetches categories,
+        article links and RSS feeds concurrently, then populates
+        :attr:`articles`.  Articles are *not* downloaded yet — call
+        :meth:`download_articles_async` afterwards.
+
+        Args:
+            input_html (str, optional): Cached HTML of the source homepage.
+                If provided, the homepage download is skipped.
+            only_homepage (bool, optional): Parse only the homepage.
+                Defaults to False.
+            only_in_path (bool, optional): Restrict discovered articles to
+                those whose URL path starts with the source URL's path.
+                Defaults to False.
+        """
+        with self._robots_init_lock:
+            self._init_robots_parser()
+
+        if input_html:
+            self.html = input_html
+        else:
+            await self.download_async()
+        self.parse()
+
+        if only_homepage:
+            self.categories = [Category(url=self.url, html=self.html, doc=self.doc)]
+        else:
+            self.set_categories()
+            await self.download_categories_async()
+        self.parse_categories()
+
+        if not only_homepage:
+            await self.set_feeds_async()
+            await self.download_feeds_async()
+
+        self.generate_articles(only_in_path=only_in_path)
+
     def size(self):
         """Returns the number of articles linked to this news source"""
         if self.articles is None:

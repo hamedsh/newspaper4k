@@ -16,6 +16,7 @@ from logging import NullHandler
 
 from .api import Configuration as Config
 from .api import build, build_article, fulltext, hot, languages, popular_urls
+from .api_async import async_article, async_build
 from .article import Article
 from .exceptions import ArticleBinaryDataException, ArticleException
 from .languages import valid_languages
@@ -56,8 +57,10 @@ def article(url: str, language: str | None = None, **kwargs) -> Article:
 
 __all__ = [
     "build",
+    "async_build",
     "build_article",
     "article",
+    "async_article",
     "fulltext",
     "hot",
     "languages",
