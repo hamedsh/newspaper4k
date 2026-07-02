@@ -1,5 +1,6 @@
 """Async HTTP helpers for newspaper4k using httpx."""
 
+import inspect
 import logging
 from collections.abc import Callable
 
@@ -29,21 +30,26 @@ def _make_client(config: Configuration | None = None) -> httpx.AsyncClient:
     headers.setdefault("Accept-Encoding", "gzip, deflate, br")
 
     proxies = cfg.requests_params.get("proxies") or {}
-    # httpx uses a single "proxy" string or mounts; map the requests-style dict
-    proxy: str | None = proxies.get("https") or proxies.get("http") if proxies else None
+    # httpx accepts either a mapping in `proxies` or a single URL string. Use the
+    # mapping when available, otherwise fall back to None.
+    proxies_param = proxies or None
+
+    # Pass through TLS/verify settings when provided in requests_params.
+    verify_param = cfg.requests_params.get("verify", True)
 
     return httpx.AsyncClient(
         headers=headers,
         follow_redirects=True,
         max_redirects=10,
-        proxy=proxy,
+        proxies=proxies_param,
+        verify=verify_param,
     )
 
 
 async def get_async_client() -> httpx.AsyncClient:
     """Return a module-level shared async client (lazy init)."""
     global _async_client  # pylint: disable=global-statement
-    if _async_client is None or _async_client.is_closed:
+    if _async_client is None or getattr(_async_client, "is_closed", False):
         _async_client = _make_client()
     return _async_client
 
@@ -51,7 +57,7 @@ async def get_async_client() -> httpx.AsyncClient:
 async def reset_async_client() -> httpx.AsyncClient:
     """Close and recreate the module-level async client."""
     global _async_client  # pylint: disable=global-statement
-    if _async_client is not None and not _async_client.is_closed:
+    if _async_client is not None and not getattr(_async_client, "is_closed", False):
         await _async_client.aclose()
     _async_client = _make_client()
     return _async_client
@@ -62,11 +68,24 @@ async def reset_async_client() -> httpx.AsyncClient:
 # ---------------------------------------------------------------------------
 
 
-async def _run_before_request_hooks(url: str, config: Configuration) -> bool:
-    """Run BEFORE_REQUEST hooks; return False if any hook denies the request."""
+async def _run_before_request_hooks(url: str, config: Configuration, method: str = "get", data: str | None = None) -> bool:
+    """Run BEFORE_REQUEST hooks; return False if any hook denies the request.
+
+    Supports both sync and async hook callables.
+    """
     continue_request = True
     for hook in get_hooks(HookableEvent.BEFORE_REQUEST):
-        result = hook(url, config)
+        try:
+            if inspect.iscoroutinefunction(hook):
+                result = await hook(url, config, method, data)
+            else:
+                result = hook(url, config, method, data)
+        except TypeError:
+            # Fallback for older hook signatures that only accept (url, config)
+            if inspect.iscoroutinefunction(hook):
+                result = await hook(url, config)
+            else:
+                result = hook(url, config)
         if result is False:
             continue_request = False
     return continue_request
@@ -111,7 +130,7 @@ async def do_request_async(
         NotImplementedError: If an unsupported HTTP method is provided.
     """
     # Run before-request hooks (e.g. robots.txt checker)
-    if not await _run_before_request_hooks(url, config):
+    if not await _run_before_request_hooks(url, config, method, data):
         raise RobotsException(f"Request to {url} blocked by a before_request hook")
 
     req_params: dict = {
@@ -123,7 +142,8 @@ async def do_request_async(
         req_params["cookies"] = config.requests_params["cookies"]
     if config.requests_params.get("auth"):
         req_params["auth"] = config.requests_params["auth"]
-    verify = config.requests_params.get("verify", True)
+    if "verify" in config.requests_params:
+        req_params["verify"] = config.requests_params.get("verify")
 
     client = await get_async_client()
 
@@ -135,12 +155,36 @@ async def do_request_async(
         else:
             raise NotImplementedError(f"Method {method} not implemented")
     except httpx.RequestError as exc:
-        # Re-raise as requests-compatible for callers that catch RequestException
-        raise httpx.RequestError(str(exc), request=exc.request) from exc
+        # Call on_error hooks similar to the sync path, then re-raise.
+        for hook in get_hooks(HookableEvent.ON_ERROR):
+            try:
+                if inspect.iscoroutinefunction(hook):
+                    await hook(url, config, method, data)
+                else:
+                    hook(url, config, method, data)
+            except TypeError:
+                # Support older hook signatures
+                if inspect.iscoroutinefunction(hook):
+                    await hook(url, config)
+                else:
+                    hook(url, config)
+        # Re-raise the original httpx exception
+        raise
 
-    # Run after-response hooks
+    # Run after-response hooks (support async hooks). Keep the same signature
+    # as sync code: (url, config, method, data) to be compatible with existing hooks.
     for hook in get_hooks(HookableEvent.AFTER_RESPONSE):
-        hook(url, config)
+        try:
+            if inspect.iscoroutinefunction(hook):
+                await hook(url, config, method, data)
+            else:
+                hook(url, config, method, data)
+        except TypeError:
+            # Fallback for simpler hook signatures
+            if inspect.iscoroutinefunction(hook):
+                await hook(url, config)
+            else:
+                hook(url, config)
 
     return response
 
